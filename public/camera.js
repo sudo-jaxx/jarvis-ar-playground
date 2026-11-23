@@ -14,6 +14,7 @@ const ctx = canvas.getContext("2d");
 let ws = null;
 let stream = null;
 let landmarker = null;
+
 let active = false;
 let mode = "avatars";
 let processing = false;
@@ -25,6 +26,12 @@ let runId = 0;
 
 function status(message) {
   state.textContent = message;
+  console.log("[JARVIS]", message);
+}
+
+function info(message) {
+  metrics.textContent = message;
+  console.log("[JARVIS]", message);
 }
 
 function send(data) {
@@ -34,12 +41,12 @@ function send(data) {
 }
 
 function connect(id) {
+  if (!active || id !== runId) return;
+
   if (!room || !token) {
-    status("Camera ready — missing room link");
+    status("Camera active — missing room credentials");
     return;
   }
-
-  if (!active || id !== runId) return;
 
   const protocol =
     location.protocol === "https:" ? "wss:" : "ws:";
@@ -51,42 +58,56 @@ function connect(id) {
   url.searchParams.set("role", "camera");
   url.searchParams.set("token", token);
 
-  try {
-    ws = new WebSocket(url);
+  status("Connecting to game display...");
 
-    ws.onopen = () => {
-      if (id !== runId) return;
-      status("Connected — tracking players");
+  try {
+    const socket = new WebSocket(url);
+    ws = socket;
+
+    socket.onopen = () => {
+      if (!active || id !== runId || ws !== socket) return;
+
+      status("Connected to game display");
+      info("Connected — checking motion tracking...");
     };
 
-    ws.onmessage = event => {
+    socket.onmessage = event => {
       try {
         const data = JSON.parse(event.data);
 
         if (data.type === "config") {
           mode = data.mode || "avatars";
+          console.log("[JARVIS] Display mode:", mode);
         }
       } catch (error) {
-        console.warn("Invalid server message", error);
+        console.warn("[JARVIS] Invalid message:", error);
       }
     };
 
-    ws.onerror = () => {
-      if (id === runId) {
-        status("Connection error — check Cloudflare");
+    socket.onerror = () => {
+      if (active && id === runId && ws === socket) {
+        status("WebSocket connection error");
       }
     };
 
-    ws.onclose = event => {
-      if (!active || id !== runId) return;
+    socket.onclose = event => {
+      if (!active || id !== runId || ws !== socket) return;
+
+      ws = null;
 
       if ([1008, 4001, 4003].includes(event.code)) {
         status("Room authorization failed — create a new room");
         return;
       }
 
-      status("Disconnected — reconnecting...");
-      reconnectTimer = setTimeout(() => connect(id), 2500);
+      status("Display disconnected — reconnecting...");
+
+      clearTimeout(reconnectTimer);
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect(id);
+      }, 2500);
     };
   } catch (error) {
     status("Connection error: " + error.message);
@@ -94,28 +115,39 @@ function connect(id) {
 }
 
 async function setupTracker() {
-  status("Loading motion tracking...");
+  info("Step 1/4: Importing MediaPipe...");
 
   const { PoseLandmarker, FilesetResolver } =
-  await import(
-    "https://esm.sh/@mediapipe/tasks-vision@0.10.22"
-  );
+    await import(
+      "https://esm.sh/@mediapipe/tasks-vision@0.10.22"
+    );
+
+  info("Step 2/4: Loading MediaPipe WASM...");
 
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
   );
 
-  return PoseLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath:
-        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-      delegate: "CPU"
-    },
-    runningMode: "VIDEO",
-    numPoses: 4,
-    minPoseDetectionConfidence: 0.45,
-    minTrackingConfidence: 0.4
-  });
+  info("Step 3/4: Loading pose detection model...");
+
+  const tracker = await PoseLandmarker.createFromOptions(
+    vision,
+    {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      numPoses: 4,
+      minPoseDetectionConfidence: 0.45,
+      minTrackingConfidence: 0.4
+    }
+  );
+
+  info("Step 4/4: MediaPipe initialized successfully");
+
+  return tracker;
 }
 
 function loop(now, id) {
@@ -128,7 +160,9 @@ function loop(now, id) {
     !landmarker ||
     video.readyState < 2 ||
     now - lastPose < 85
-  ) return;
+  ) {
+    return;
+  }
 
   processing = true;
   lastPose = now;
@@ -163,7 +197,13 @@ function loop(now, id) {
       canvas.width = 320;
       canvas.height = 180;
 
-      ctx.drawImage(video, 0, 0, 320, 180);
+      ctx.drawImage(
+        video,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+      );
 
       send({
         type: "frame",
@@ -171,13 +211,20 @@ function loop(now, id) {
       });
     }
 
-    metrics.textContent =
-      `Players: ${poses.length} | Updates: ${frames} | ` +
-      `Server: ${ws?.readyState === WebSocket.OPEN ? "Online" : "Offline"}`;
+    info(
+      `Players: ${poses.length} | ` +
+      `Updates: ${frames} | ` +
+      `Server: ${
+        ws?.readyState === WebSocket.OPEN
+          ? "Online"
+          : "Offline"
+      }`
+    );
 
   } catch (error) {
-    console.error("Tracking error:", error);
+    console.error("[JARVIS] Tracking error:", error);
     status("Tracking error: " + error.message);
+    info("Detection failed: " + error.message);
   } finally {
     processing = false;
   }
@@ -188,11 +235,15 @@ start.onclick = async () => {
 
   const id = ++runId;
   start.disabled = true;
+
   status("Requesting camera...");
+  info("Initializing camera...");
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error("Camera API unavailable. Use HTTPS.");
+      throw new Error(
+        "Camera API unavailable. Open this site using HTTPS."
+      );
     }
 
     stream = await navigator.mediaDevices.getUserMedia({
@@ -215,7 +266,9 @@ start.onclick = async () => {
     active = true;
     stop.disabled = false;
 
-    status("Camera active — connecting...");
+    status("Camera preview working");
+    info("Camera started successfully");
+
     connect(id);
 
     try {
@@ -227,17 +280,32 @@ start.onclick = async () => {
         return;
       }
 
-      status("Motion tracking ready");
+      console.log(
+        "[JARVIS] MediaPipe initialized successfully"
+      );
+
+      info("Tracking model loaded — starting detection...");
+
       requestAnimationFrame(t => loop(t, id));
 
+      info("Tracking loop starting...");
+
     } catch (error) {
-      console.error("MediaPipe failed:", error);
-      status("Camera works — tracking failed: " + error.message);
+      console.error("[JARVIS] MediaPipe failed:", error);
+
+      status("Camera works — tracking failed");
+
+      info(
+        "Tracking failed: " +
+        (error?.message || String(error))
+      );
     }
 
   } catch (error) {
-    console.error("Camera failed:", error);
+    console.error("[JARVIS] Camera error:", error);
+
     status("Camera error: " + error.message);
+    info("Camera initialization failed");
 
     stream?.getTracks().forEach(track => track.stop());
     stream = null;
@@ -250,6 +318,7 @@ function shutdown() {
   active = false;
 
   clearTimeout(reconnectTimer);
+  reconnectTimer = null;
 
   ws?.close();
   ws = null;
@@ -264,12 +333,16 @@ function shutdown() {
 
   processing = false;
   frames = 0;
+  lastPose = 0;
+  lastFrame = 0;
 
   start.disabled = false;
   stop.disabled = true;
 
   status("Camera stopped");
+  info("Ready to restart");
 }
 
 stop.onclick = shutdown;
+
 window.addEventListener("pagehide", shutdown);
