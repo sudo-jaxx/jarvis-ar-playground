@@ -97,9 +97,9 @@ async function setupTracker() {
   status("Loading motion tracking...");
 
   const { PoseLandmarker, FilesetResolver } =
-    await import(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm"
-    );
+  await import(
+    "https://esm.sh/@mediapipe/tasks-vision@0.10.22"
+  );
 
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm"
